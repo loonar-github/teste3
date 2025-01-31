@@ -1,0 +1,95 @@
+name: Release repository and copy to loonar-morpheus organization
+on:
+  release:
+    types:
+      - created
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: write
+  actions: write
+  packages: write
+  deployments: write
+  security-events: write
+
+jobs:
+  install-gh-cli:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+
+  check-ci-status:
+    runs-on: ubuntu-24.04
+    needs: install-gh-cli
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Check CI
+        run: |
+          CI_STATUS=$(gh run list --workflow=CI --branch=main --json status --jq '.[0].status')
+
+          if [ "$CI_STATUS" != "completed" ]; then
+            echo "CI workflow is not completed. Exiting..."
+            exit 1
+          fi
+          CI_CONCLUSION=$(gh run list --workflow=CI --branch=main --json conclusion --jq '.[0].conclusion')
+          if [ "$CI_CONCLUSION" != "success" ]; then
+            echo "CI workflow did not succeed. Exiting..."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_PAT }}
+  
+  copy-repo:
+    runs-on: ubuntu-24.04
+    needs: check-ci-status
+
+    steps:
+      - name: Checkout Source Repository
+        id: checkout_source
+        uses: actions/checkout@v3
+      
+      - name: Check if Destination Repository Exists
+        id: check_repo
+        run: |
+          if gh repo view "${{ vars.DESTINATION_ORG }}/$(basename $GITHUB_REPOSITORY)" > /dev/null 2>&1; then
+            echo "result=repository exists"
+            echo "REPO_EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "repository does not exist"
+            echo "REPO_EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_PAT }}
+  
+      - name: Create Destination Repository if it Doesn't Exist
+        id: create_repo
+        if: steps.check_repo.outputs.REPO_EXISTS == 'false'
+        run: | 
+            REPO_NAME=$(basename $GITHUB_REPOSITORY)
+            echo "Creating repository: ${{ vars.DESTINATION_ORG }}/$REPO_NAME"
+            gh repo create "${{ vars.DESTINATION_ORG }}/$REPO_NAME" --private
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_PAT }}
+
+      - name: Create Bare Clone of Source Repository
+        id: clone_repo
+        run: git clone --bare https://github.com/${{ vars.SOURCE_ORG }}/${{ github.event.repository.name }}.git
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_PAT }}
+
+      - name: Mirror Push to Destination Repository
+        id: mirror_push
+        run: |
+          REPO_NAME=$(basename $GITHUB_REPOSITORY)  
+          cd ${REPO_DIR}.git
+          git push --mirror https://github.com/${{ vars.DESTINATION_ORG }}/$REPO_NAME.git
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_PAT }}
